@@ -1,7 +1,7 @@
 import { FlynetOAuth } from "@flynetdev/core";
 
 // Server-only OAuth wiring (Token-Mediating Backend, per the Flynet docs):
-// the backend holds CLIENT_SECRET and the refresh token; the browser only ever
+// the backend holds BLACKBIRD_CLIENT_SECRET and the refresh token; the browser only ever
 // sees the short-lived access token. Never import this from a Client Component.
 
 /** Short-lived member access token (60 min, mirrors the token's expires_in). */
@@ -43,8 +43,8 @@ export function appUrl(path: string, requestUrl: string | URL): URL {
 
 /** Build the SDK's OAuth helper from env, or null when the app isn't configured. */
 export function makeOAuth(): FlynetOAuth | null {
-  const clientId = process.env.CLIENT_ID;
-  const clientSecret = process.env.CLIENT_SECRET;
+  const clientId = process.env.BLACKBIRD_CLIENT_ID;
+  const clientSecret = process.env.BLACKBIRD_CLIENT_SECRET;
   if (!clientId || !clientSecret) return null;
   return new FlynetOAuth({
     clientId,

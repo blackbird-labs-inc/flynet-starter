@@ -16,7 +16,7 @@ through the SDK. Use it as the starting point for your own integration.
 git clone <your-fork-url> flynet-starter
 cd flynet-starter
 npm install
-cp .env.example .env.local      # then set API_KEY in .env.local
+cp .env.example .env.local      # then set BLACKBIRD_API_KEY in .env.local
 npm run dev
 ```
 
@@ -80,7 +80,7 @@ hexes):
 
 The wallet and passport need a member token. There are two ways to get one:
 
-1. **Sign in with Blackbird (default).** With `CLIENT_ID`, `CLIENT_SECRET`, and
+1. **Sign in with Blackbird (default).** With `BLACKBIRD_CLIENT_ID`, `BLACKBIRD_CLIENT_SECRET`, and
    `REDIRECT_URI` set, the page shows a sign-in button. It runs the full OAuth
    authorization-code + PKCE flow server-side via the SDK's `FlynetOAuth`
    helper: tokens are stored in HttpOnly cookies, the access token auto-renews

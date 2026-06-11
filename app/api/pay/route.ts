@@ -20,10 +20,10 @@ export async function POST(req: Request) {
     );
   }
 
-  const merchantId = process.env.MERCHANT_ID;
+  const merchantId = process.env.BLACKBIRD_MERCHANT_ID;
   if (!merchantId) {
     return NextResponse.json(
-      { error: "MERCHANT_ID is not set in .env.local." },
+      { error: "BLACKBIRD_MERCHANT_ID is not set in .env.local." },
       { status: 500 },
     );
   }
