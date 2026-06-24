@@ -60,7 +60,7 @@ export function resolvedRedirectUri(): string | null {
 }
 
 /**
- * Where browser-facing auth redirects land. Behind a tunnel (ngrok/Codespaces)
+ * Where browser-facing auth redirects land. Behind a tunnel (Flynet dev/Codespaces)
  * the request URL the server sees carries the local host, not the public one —
  * so derive the public origin from the resolved redirect URI (the OAuth
  * session's cookies live on that host by definition) and fall back to the

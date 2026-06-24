@@ -6,7 +6,7 @@ import { AnimatePresence, motion } from "framer-motion";
 // Developer onboarding drawer. Renders only in dev (layout.tsx gates it on
 // NODE_ENV), and its backend routes 404 in production too. It has two views,
 // switched by the `view` state and a back affordance in the header:
-//   • setup    — get the starter running (Blackbird credentials, tunnel).
+//   • setup    — get the starter running (Blackbird credentials, dev tunnel).
 //   • deploy   — "I'm ready to deploy": how to ship to Vercel and which env
 //                vars to set there. Pure UI, copies to clipboard.
 // Everything talks to /api/dev/* — nothing here touches real secrets directly.
@@ -14,11 +14,11 @@ import { AnimatePresence, motion } from "framer-motion";
 type FieldStatus = { isSet: boolean; masked: string | null };
 // Step 2's backend reports the public URL sign-in redirects back to, plus which
 // environment produced it: a Codespace forwards a URL automatically, local dev
-// gets one from a running ngrok agent. The UI branches on `kind`.
+// derives it from REDIRECT_URI (the Flynet dev tunnel). The UI branches on `kind`.
 type TunnelStatus = {
   running: boolean;
   url: string | null;
-  kind: "codespaces" | "ngrok";
+  kind: "codespaces" | "flynet";
 };
 
 type View = "setup" | "deploy";
@@ -62,9 +62,9 @@ const CREDENTIALS: {
   {
     name: "REDIRECT_URI",
     label: "Redirect URI",
-    help: "Your tunnel (flynet make) or deployed https URL + /callback. Whitelist it at make.flynet.org (sign in with your Slack email).",
+    help: "Your tunnel (or deployed) https URL + /callback. Usually filled in for you when you redeem a maker token; the tunnel runs at this URL minus /callback.",
     secret: false,
-    placeholder: "https://<subdomain>.local.make.flynet.org/callback",
+    placeholder: "https://<your-tunnel>/callback",
   },
 ];
 
@@ -258,16 +258,12 @@ export function OpenDevSetupButton({
 }
 
 // ── Setup view ───────────────────────────────────────────────────────────────
-// Holds the two setup steps plus the nav cards. It owns a `credReloadToken` so
-// the ngrok step can poke the credentials step to refetch its status — used
-// when "Use as Redirect URI" writes REDIRECT_URI, so it flips to ✓ Configured
-// without the developer reopening the drawer.
+// Holds the two setup steps (credentials + tunnel) plus the nav cards.
 function SetupView({ setView }: { setView: (v: View) => void }) {
-  const [credReloadToken, setCredReloadToken] = useState(0);
   return (
     <>
-      <CredentialsStep reloadToken={credReloadToken} />
-      <TunnelStep onRedirectUriSaved={() => setCredReloadToken((t) => t + 1)} />
+      <CredentialsStep />
+      <TunnelStep />
       <NavCard
         title="I'm ready to deploy"
         hint="Ship to Vercel — push, import, and set your env vars there."
@@ -282,7 +278,7 @@ function SetupView({ setView }: { setView: (v: View) => void }) {
 // through the live API (Discovery for the key, the OAuth token endpoint for the
 // client pair) and shape-checks the redirect URI before any of them are written
 // to .env.local — so a typo is caught here, not at runtime.
-function CredentialsStep({ reloadToken }: { reloadToken?: number }) {
+function CredentialsStep() {
   const [status, setStatus] = useState<CredStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [values, setValues] = useState<Partial<Record<CredField, string>>>({});
@@ -309,12 +305,6 @@ function CredentialsStep({ reloadToken }: { reloadToken?: number }) {
   useEffect(() => {
     load();
   }, [load]);
-
-  // Refetch when a sibling step changes the env (e.g. ngrok writing
-  // REDIRECT_URI). Skip the initial 0 — the mount effect above already loaded.
-  useEffect(() => {
-    if (reloadToken) load();
-  }, [reloadToken, load]);
 
   const isShown = (f: CredField) => !status?.[f]?.isSet || editing[f];
   // Anything the developer has typed into a visible field.
@@ -374,6 +364,7 @@ function CredentialsStep({ reloadToken }: { reloadToken?: number }) {
       done={allSet}
       hint="API key, OAuth client id/secret, and redirect URI. Verified, then written to .env.local."
     >
+      <RedeemToken onRedeemed={load} />
       {loading ? (
         <Skeleton />
       ) : (
@@ -471,32 +462,102 @@ function CredentialsStep({ reloadToken }: { reloadToken?: number }) {
   );
 }
 
-// ── Step 2: tunnel ───────────────────────────────────────────────────────────
-// Hand this to the agent so it does the tunnel setup — runs `flynet make`
-// (ngrok is the fallback) — without the dev juggling a second terminal. The
-// agent stops at reporting the URL: it never writes .env.local (the dev sets
-// REDIRECT_URI with the "Use as Redirect URI" button here).
-const AGENT_TUNNEL_PROMPT =
-  "Open a tunnel to my local app on port 3000 and tell me the public https " +
-  "URL. Use `flynet make` (the everyday tunnel command — it gives a " +
-  "https://<subdomain>.local.make.flynet.org URL). If `flynet make` isn't " +
-  "available, fall back to ngrok: my authtoken is <paste it here>, so add it " +
-  "with `ngrok config add-authtoken`, then run `ngrok http 3000`. Don't touch " +
-  ".env.local — I'll set REDIRECT_URI from the dev setup drawer.";
+// Redeem a one-time maker token (mk_otk_…) instead of pasting each credential.
+// Posts to the dev-only /api/dev/redeem route, which exchanges the token
+// server-side and writes the returned keys to .env.local — the secret never
+// reaches the browser. On success it pokes the credentials step to refresh.
+function RedeemToken({ onRedeemed }: { onRedeemed: () => void }) {
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
-function TunnelStep({
-  onRedirectUriSaved,
-}: {
-  onRedirectUriSaved?: () => void;
-}) {
+  async function redeem() {
+    const t = token.trim();
+    if (!t) return;
+    setBusy(true);
+    setMsg(null);
+    try {
+      const res = await fetch("/api/dev/redeem", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: t }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const extra = Array.isArray(data.responseFields)
+          ? ` (response had: ${data.responseFields.join(", ")})`
+          : "";
+        throw new Error((data.error ?? "Couldn't redeem the token.") + extra);
+      }
+      const applied: string[] = data.applied ?? [];
+      setMsg({ ok: true, text: `Redeemed ✓ — set ${applied.join(", ")}` });
+      setToken("");
+      onRedeemed();
+    } catch (e) {
+      setMsg({
+        ok: false,
+        text: e instanceof Error ? e.message : "Couldn't redeem the token.",
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="mb-4 space-y-2 rounded-xl border border-primary/30 bg-primary/5 p-3">
+      <div>
+        <p className="text-sm font-medium text-foreground">Have a maker token?</p>
+        <p className="text-[11px] leading-relaxed text-subtle">
+          Paste a one-time <code className="font-mono">mk_otk_…</code> token to
+          fetch and fill these credentials automatically — no need to enter each
+          one below.
+        </p>
+      </div>
+      <div className="flex items-center gap-2">
+        <input
+          type="password"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") redeem();
+          }}
+          placeholder="mk_otk_…"
+          className="min-w-0 flex-1 rounded-xl border border-strong bg-surface-low px-3 py-2 text-sm text-foreground placeholder:text-subtle focus:border-primary focus:outline-none"
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <button
+          type="button"
+          onClick={redeem}
+          disabled={busy || !token.trim()}
+          className="inline-flex h-9 shrink-0 items-center justify-center rounded-full bg-primary px-4 text-sm font-semibold text-primary-foreground transition hover:opacity-90 active:bg-primary-dim disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          {busy ? "Redeeming…" : "Redeem"}
+        </button>
+      </div>
+      {msg ? (
+        <p className={`text-xs ${msg.ok ? "text-success" : "text-failure"}`}>
+          {msg.text}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+// ── Step 2: Flynet dev tunnel ────────────────────────────────────────────────
+// The public sign-in URL. Its address is REDIRECT_URI minus /callback (written
+// when you redeem a maker token, or set by hand in step 1), and the tunnel
+// itself is started with `flynet dev`. Hand this prompt to the agent to start
+// it without juggling a second terminal — the agent reports the URL and never
+// touches .env.local.
+const AGENT_TUNNEL_PROMPT =
+  "Start my Flynet dev tunnel by running `flynet dev` in the project, then tell " +
+  "me the public https URL to open. Don't touch .env.local.";
+
+function TunnelStep() {
   const [status, setStatus] = useState<TunnelStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
-  const [settingRedirect, setSettingRedirect] = useState(false);
-  const [redirectMsg, setRedirectMsg] = useState<{
-    ok: boolean;
-    text: string;
-  } | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -504,7 +565,7 @@ function TunnelStep({
       const res = await fetch("/api/dev/tunnel");
       setStatus((await res.json()) as TunnelStatus);
     } catch {
-      setStatus({ running: false, url: null, kind: "ngrok" });
+      setStatus({ running: false, url: null, kind: "flynet" });
     } finally {
       setLoading(false);
     }
@@ -514,17 +575,15 @@ function TunnelStep({
     load();
   }, [load]);
 
-  // What actually gets whitelisted and saved as REDIRECT_URI: the tunnel URL
-  // plus /callback. Display and copy THIS (not the bare host) so what you paste
-  // into the whitelist matches what "Use as Redirect URI" saves.
-  const callbackUrl = status?.url
-    ? `${status.url.replace(/\/+$/, "")}/callback`
-    : null;
+  const running = status?.running ?? false;
+  const kind = status?.kind ?? "flynet";
+  const isCodespace = kind === "codespaces";
+  const url = status?.url ?? null;
 
   async function copy() {
-    if (!callbackUrl) return;
+    if (!url) return;
     try {
-      await navigator.clipboard.writeText(callbackUrl);
+      await navigator.clipboard.writeText(url);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
@@ -532,53 +591,15 @@ function TunnelStep({
     }
   }
 
-  // Save the callback URL straight into REDIRECT_URI via the same endpoint the
-  // credentials step uses, then tell that step to refresh so it shows the
-  // redirect URI as configured. The server validates the shape.
-  async function useAsRedirect() {
-    if (!callbackUrl) return;
-    const redirectUri = callbackUrl;
-    setSettingRedirect(true);
-    setRedirectMsg(null);
-    try {
-      const res = await fetch("/api/dev/env", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ values: { REDIRECT_URI: redirectUri } }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(
-          data.fieldErrors?.REDIRECT_URI ??
-            data.error ??
-            "Couldn't set the redirect URI.",
-        );
-      }
-      setRedirectMsg({ ok: true, text: "Saved ✓ — now whitelist it below ↓" });
-      onRedirectUriSaved?.();
-    } catch (e) {
-      setRedirectMsg({
-        ok: false,
-        text: e instanceof Error ? e.message : "Couldn't set it.",
-      });
-    } finally {
-      setSettingRedirect(false);
-    }
-  }
-
-  const running = status?.running ?? false;
-  const kind = status?.kind ?? "ngrok";
-  const isCodespace = kind === "codespaces";
-
   return (
     <Section
       index={2}
-      title={isCodespace ? "Cloud preview URL" : "Tunnel (flynet make)"}
+      title={isCodespace ? "Cloud preview URL" : "Flynet dev tunnel"}
       done={running}
       hint={
         isCodespace
           ? "Public URL for sign-in — auto-detected from your Codespace."
-          : "Public URL for local sign-in — Blackbird blocks localhost."
+          : "Public URL for sign-in — Blackbird blocks localhost, so the login flow has to run here."
       }
       action={
         <button
@@ -593,48 +614,44 @@ function TunnelStep({
     >
       {loading ? (
         <Skeleton />
-      ) : running ? (
+      ) : running && url ? (
         <div className="space-y-2">
           <div className="flex items-center gap-2 text-sm text-success">
             <span className="inline-block h-2 w-2 rounded-full bg-success" />
             {isCodespace ? "Codespace preview is live" : "Tunnel is running"}
           </div>
-          <button
-            type="button"
-            onClick={copy}
-            title="Copy callback URL"
-            className="flex w-full items-center gap-2 rounded-xl border border-strong bg-surface-low px-3 py-2 text-left font-mono text-xs text-foreground transition hover:bg-surface"
-          >
-            <span className="truncate">{callbackUrl}</span>
-            <span className="ml-auto shrink-0 text-[11px] text-muted">
-              {copied ? "Copied!" : "Copy"}
-            </span>
-          </button>
 
-          {/* One-click: write <tunnel>/callback into REDIRECT_URI so the dev
-              doesn't have to copy, append /callback, and paste it up top. */}
+          {/* Open the app ON the tunnel host — the whole sign-in round-trip has
+              to run there, not on localhost (session cookies are host-scoped). */}
+          <a
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            className="flex w-full items-center gap-2 rounded-xl border border-primary/40 bg-primary/5 px-3 py-2 font-mono text-xs text-foreground transition hover:bg-primary/10"
+          >
+            <span className="truncate">{url}</span>
+            <span className="ml-auto shrink-0 text-[11px] font-semibold text-primary-bright">
+              Open in new tab ↗
+            </span>
+          </a>
+
           <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={useAsRedirect}
-              disabled={settingRedirect}
-              className="inline-flex h-9 items-center justify-center rounded-full bg-primary px-4 text-sm font-semibold text-primary-foreground transition hover:opacity-90 active:bg-primary-dim disabled:cursor-not-allowed disabled:opacity-40"
+              onClick={copy}
+              className="text-xs text-primary-bright underline-offset-2 hover:underline"
             >
-              {settingRedirect ? "Setting…" : "Use as Redirect URI →"}
+              {copied ? "Copied!" : "Copy URL"}
             </button>
-            {redirectMsg ? (
-              <span
-                className={`text-xs ${redirectMsg.ok ? "text-success" : "text-failure"}`}
-              >
-                {redirectMsg.text}
-              </span>
-            ) : null}
+            <span className="text-[11px] leading-relaxed text-subtle">
+              Open this in a new tab and use the app there — sign-in only works
+              on the tunnel host.
+            </span>
           </div>
 
           {/* Codespaces forwards new ports as private (they require a GitHub
               login), so the Blackbird redirect can't reach the callback until
-              port 3000 is flipped to Public. This is the one manual Codespaces
-              step the platform won't let us do for you. */}
+              port 3000 is flipped to Public. The one manual Codespaces step. */}
           {isCodespace ? (
             <p className="rounded-lg border border-brand-yellow/30 bg-brand-yellow/10 px-3 py-2 text-xs leading-relaxed text-brand-yellow">
               Set port <code className="font-mono">3000</code> to{" "}
@@ -645,46 +662,22 @@ function TunnelStep({
               ) — sign-in can&apos;t reach a private Codespace port.
             </p>
           ) : null}
-
-          {/* The tunnel URL only works for OAuth once its /callback is
-              whitelisted on the Blackbird side — point the dev at the self-serve
-              portal so they can add it themselves. */}
-          <p className="rounded-lg border border-brand-yellow/30 bg-brand-yellow/10 px-3 py-2 text-xs leading-relaxed text-brand-yellow">
-            Whitelist <code className="font-mono">{callbackUrl}</code> for the
-            Blackbird API: sign in with your Slack email at{" "}
-            <a
-              href="https://make.flynet.org/"
-              target="_blank"
-              rel="noreferrer"
-              className="underline underline-offset-2"
-            >
-              make.flynet.org
-            </a>{" "}
-            and add it there.
-          </p>
         </div>
       ) : (
         <div className="space-y-3">
           <div className="flex items-center gap-2 text-sm text-muted">
             <span className="inline-block h-2 w-2 rounded-full bg-failure" />
-            No tunnel detected yet
+            Tunnel is not running
           </div>
 
-          {/* Primary path: `flynet make` is the everyday tunnel command — it
-              opens a tunnel to the local app at *.local.make.flynet.org. */}
-          <p className="text-xs text-subtle">
-            Run the everyday tunnel command, then Re-check above:
+          {/* The tunnel needs the API key (step 1) first, then `flynet dev`.
+              Easiest path: hand the agent the prompt and let it start the tunnel
+              and report the URL. */}
+          <p className="text-xs leading-relaxed text-subtle">
+            Add your Flynet API key first (step 1), then start the tunnel with{" "}
+            <code className="font-mono text-foreground">flynet dev</code>. Easiest
+            is to let your agent do it:
           </p>
-          <div className="flex items-center gap-2 rounded-xl border border-strong bg-surface-low px-3 py-2">
-            <code className="flex-1 font-mono text-xs text-foreground">
-              flynet make
-            </code>
-            <CopyIconButton text="flynet make" label="Copy command" />
-          </div>
-
-          {/* Easiest path: hand the agent the prompt; it runs the tunnel for
-              you (flynet make, or ngrok as a fallback). */}
-          <p className="text-xs text-subtle">Or ask your agent to do it:</p>
           <div className="flex items-start gap-2 rounded-xl border border-strong bg-surface-low px-3 py-2">
             <code className="flex-1 font-mono text-xs leading-relaxed text-foreground">
               {AGENT_TUNNEL_PROMPT}
@@ -692,25 +685,16 @@ function TunnelStep({
             <CopyIconButton text={AGENT_TUNNEL_PROMPT} label="Copy prompt" />
           </div>
 
-          {/* Fallback: ngrok. It refuses to tunnel without an authtoken, and a
-              bare `ngrok http 3000` fails with an opaque error if you skip it,
-              so point first-timers at the free signup before they hit that. */}
-          <p className="rounded-lg border border-brand-yellow/30 bg-brand-yellow/10 px-3 py-2 text-xs leading-relaxed text-brand-yellow">
-            Fallback — no <code className="font-mono">flynet make</code>? Use
-            ngrok. First time, grab a free authtoken at{" "}
-            <a
-              href="https://dashboard.ngrok.com/get-started/your-authtoken"
-              target="_blank"
-              rel="noreferrer"
-              className="underline underline-offset-2"
-            >
-              ngrok.com
-            </a>
-            , run{" "}
-            <code className="font-mono">ngrok config add-authtoken &lt;token&gt;</code>
-            , then <code className="font-mono">ngrok http 3000</code> — and
-            Re-check above.
+          {/* Or run it by hand, then Re-check. */}
+          <p className="text-xs text-subtle">
+            Or run it yourself, then Re-check above:
           </p>
+          <div className="flex items-center gap-2 rounded-xl border border-strong bg-surface-low px-3 py-2">
+            <code className="flex-1 font-mono text-xs text-foreground">
+              flynet dev
+            </code>
+            <CopyIconButton text="flynet dev" label="Copy command" />
+          </div>
         </div>
       )}
     </Section>
@@ -857,7 +841,7 @@ function DeployView() {
           localhost. */}
       <p className="rounded-lg border border-brand-yellow/30 bg-brand-yellow/10 px-3 py-2 text-xs leading-relaxed text-brand-yellow">
         Heads up: don&apos;t carry your local{" "}
-        <code className="font-mono">REDIRECT_URI</code> (the ngrok/Codespace URL)
+        <code className="font-mono">REDIRECT_URI</code> (the tunnel/Codespace URL)
         over to Vercel — the app derives the right one from your production
         domain. The one thing you must do is whitelist your{" "}
         <code className="font-mono">https://&lt;your-app&gt;.vercel.app/callback</code>{" "}

@@ -126,7 +126,7 @@ function validateRedirectUri(value: string): string | null {
   try {
     url = new URL(value);
   } catch {
-    return "Enter an absolute URL, e.g. https://<subdomain>.ngrok.app/callback.";
+    return "Enter an absolute URL, e.g. https://<your-tunnel>/callback.";
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") {
     return "The redirect URI must be an http(s) URL.";
